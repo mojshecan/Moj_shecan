@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Collect public proxy configs (Iranian repos first), test with xray,
 publish a base64 subscription to docs/sub.txt.
-Supports vless / vmess / trojan (TLS or Reality) and shadowsocks (no plugin)."""
+Supports vless / vmess / trojan (TLS or Reality) and shadowsocks (no plugin).
+Names: "Moj_shecan <flag><number>" per exit country."""
 import base64, json, os, random, re, socket, subprocess, tempfile
 import threading, time
 import urllib.request
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
 OUT_DIR = "docs"
+NAME_PREFIX = "Moj_shecan"
 TOP_N = int(os.getenv("TOP_N", "120"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "1500"))
 IRAN_SHARE = 0.7
@@ -28,7 +30,6 @@ OPTIONAL = [
     "https://labs.google/",
 ]
 
-# Persian / Iranian-flavoured queries first
 SEARCH_QUERIES = [
     "فیلترشکن", "کانفیگ v2ray", "v2ray ایران", "vless iran",
     "persian v2ray", "iran v2ray config", "free v2ray subscription",
@@ -283,6 +284,29 @@ def curl(port, url):
         return False, 99.0
 
 
+def flag(cc):
+    if not cc or len(cc) != 2 or not cc.isalpha():
+        return "🌐"
+    return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc.upper())
+
+
+def get_country(port):
+    for url, kind in (("https://api.country.is", "json"),
+                      ("http://ip-api.com/line/?fields=countryCode", "line")):
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{port}",
+                 "--max-time", "6", url],
+                capture_output=True, text=True, timeout=9)
+            out = r.stdout.strip()
+            cc = json.loads(out).get("country", "") if kind == "json" else out
+            if len(cc) == 2 and cc.isalpha():
+                return cc.upper()
+        except Exception:
+            continue
+    return ""
+
+
 def test(item):
     link, outbound, host = item
     port = next_port()
@@ -314,7 +338,8 @@ def test(item):
         for url in OPTIONAL:
             ok, _ = curl(port, url)
             score += 1 if ok else 0
-        return link, score, total / len(REQUIRED), host
+        cc = get_country(port)
+        return link, score, total / len(REQUIRED), host, cc
     finally:
         p.kill()
         try:
@@ -370,11 +395,11 @@ def main():
 
     results.sort(key=lambda r: (-r[1], r[2]))
     per_host, final = {}, []
-    for link, score, lat, host in results:
+    for link, score, lat, host, cc in results:
         if per_host.get(host, 0) >= MAX_PER_HOST:
             continue
         per_host[host] = per_host.get(host, 0) + 1
-        final.append((link, score, lat))
+        final.append((link, cc or "ZZ"))
         if len(final) >= TOP_N:
             break
 
@@ -382,8 +407,13 @@ def main():
     if not final:
         print("nothing passed; keeping previous sub.txt")
         return
-    lines = [rename(l, f"W{i+1:03d}-{int(lat*1000)}ms-s{s}")
-             for i, (l, s, lat) in enumerate(final)]
+
+    final.sort(key=lambda x: x[1])
+    counters, lines = {}, []
+    for link, cc in final:
+        counters[cc] = counters.get(cc, 0) + 1
+        lines.append(rename(link, f"{NAME_PREFIX} {flag(cc)}{counters[cc]}"))
+
     with open(f"{OUT_DIR}/sub.txt", "w") as f:
         f.write(base64.b64encode("\n".join(lines).encode()).decode())
     with open(f"{OUT_DIR}/stats.json", "w") as f:
