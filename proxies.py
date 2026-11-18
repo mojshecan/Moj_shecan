@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Collect public Telegram MTProto proxies, check TCP reachability,
+"""Collect public Telegram MTProto proxies, keep only ONLY_COUNTRY (default IR),
 save docs/proxies.json and post TOP_N of them to a Telegram channel."""
 import html, json, os, random, re, socket, time
-import urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote, urlparse
@@ -10,7 +10,8 @@ from urllib.parse import parse_qs, quote, urlparse
 OUT_DIR = "docs"
 STATE = f"{OUT_DIR}/last_msg.txt"
 TOP_N = int(os.getenv("TOP_N", "10"))
-MAX_CANDIDATES = 3000
+MAX_CANDIDATES = 2000
+ONLY_COUNTRY = os.getenv("ONLY_COUNTRY", "IR").strip().upper()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 GH_TOKEN = os.getenv("GH_TOKEN", "")
@@ -99,6 +100,7 @@ def parse(link):
 
 
 def probe(c):
+    """Return (candidate, best_ms) or (candidate, None) if unreachable from here."""
     server, port, _ = c
     best = None
     for _ in range(2):
@@ -107,7 +109,7 @@ def probe(c):
             with socket.create_connection((server, port), timeout=4):
                 pass
         except Exception:
-            return None
+            return c, None
         ms = (time.time() - t) * 1000
         best = ms if best is None else min(best, ms)
     return c, best
@@ -119,25 +121,33 @@ def flag(cc):
     return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc.upper())
 
 
-def countries(hosts):
-    ips = {}
-    for h in hosts:
-        try:
-            ips[h] = socket.gethostbyname(h)
-        except Exception:
-            pass
-    uniq = list(set(ips.values()))[:100]
-    m = {}
+def resolve(h):
     try:
-        body = json.dumps([{"query": ip, "fields": "countryCode,query"}
-                           for ip in uniq]).encode()
-        req = urllib.request.Request(
-            "http://ip-api.com/batch", data=body,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            m = {x["query"]: x.get("countryCode", "") for x in json.loads(r.read())}
-    except Exception as e:
-        print(f"[geo skip] {e}")
+        return h, socket.gethostbyname(h)
+    except Exception:
+        return h, None
+
+
+def countries(hosts):
+    with ThreadPoolExecutor(50) as ex:
+        ips = {h: ip for h, ip in ex.map(resolve, hosts) if ip}
+    uniq = list(set(ips.values()))
+    m = {}
+    for i in range(0, len(uniq), 100):
+        chunk = uniq[i:i + 100]
+        try:
+            body = json.dumps([{"query": ip, "fields": "countryCode,query"}
+                               for ip in chunk]).encode()
+            req = urllib.request.Request(
+                "http://ip-api.com/batch", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                for x in json.loads(r.read()):
+                    m[x["query"]] = x.get("countryCode", "")
+        except Exception as e:
+            print(f"[geo skip] {e}")
+        if i + 100 < len(uniq):
+            time.sleep(4.5)  # free API limit for batch requests
     return {h: m.get(ip, "") for h, ip in ips.items()}
 
 
@@ -180,6 +190,11 @@ def post(picks):
     print(f"posted message {new_id}")
 
 
+def prio(secret):
+    s = secret.lower()
+    return 0 if s.startswith("ee") else 1 if s.startswith("dd") else 2
+
+
 def main():
     urls = discover()
     print(f"files to read: {len(urls)}")
@@ -197,32 +212,45 @@ def main():
 
     random.shuffle(cands)
     cands = cands[:MAX_CANDIDATES]
-    with ThreadPoolExecutor(100) as ex:
-        alive = [r for r in ex.map(probe, cands) if r]
-    print(f"tcp reachable: {len(alive)}")
 
-    # one proxy per server, fake-TLS (ee) first, then dd, then others; random inside groups
-    def prio(secret):
-        s = secret.lower()
-        return 0 if s.startswith("ee") else 1 if s.startswith("dd") else 2
+    geo = countries(sorted({c[0] for c in cands}))
+    if ONLY_COUNTRY:
+        cands = [c for c in cands if geo.get(c[0]) == ONLY_COUNTRY]
+    print(f"after country filter ({ONLY_COUNTRY or 'all'}): {len(cands)}")
 
-    random.shuffle(alive)
-    alive.sort(key=lambda x: prio(x[0][2]))
-    chosen, hosts = [], set()
-    for (server, port, secret), ms in alive:
-        if server in hosts:
+    # Testing is OFF by default (domestic-only proxies fail from outside Iran).
+    # Set TEST_PROXIES=1 in the workflow to turn it back on.
+    tested = os.getenv("TEST_PROXIES", "0") == "1"
+    alive = set()
+    if tested:
+        with ThreadPoolExecutor(100) as ex:
+            alive = {c for c, ms in ex.map(probe, cands) if ms is not None}
+        print(f"reachable from runner: {len(alive)}")
+
+    def url_of(c):
+        return (f"https://t.me/proxy?server={quote(c[0])}&port={c[1]}"
+                f"&secret={quote(c[2])}")
+
+    try:
+        with open(f"{OUT_DIR}/proxies.json") as f:
+            prev = {p["url"] for p in json.load(f)["proxies"]}
+    except Exception:
+        prev = set()
+
+    # not posted last time first, (reachable first if tested), then ee, dd, others
+    random.shuffle(cands)
+    cands.sort(key=lambda c: (url_of(c) in prev,
+                              (c not in alive) if tested else False,
+                              prio(c[2])))
+
+    picks, hosts = [], set()
+    for c in cands:
+        if c[0] in hosts:
             continue
-        hosts.add(server)
-        chosen.append((server, port, secret))
-        if len(chosen) >= TOP_N * 2:
+        hosts.add(c[0])
+        picks.append((url_of(c), geo.get(c[0], "")))
+        if len(picks) >= TOP_N:
             break
-
-    geo = countries([c[0] for c in chosen])
-    picks = []
-    for server, port, secret in chosen[:TOP_N]:
-        url = (f"https://t.me/proxy?server={quote(server)}&port={port}"
-               f"&secret={quote(secret)}")
-        picks.append((url, geo.get(server, "")))
 
     if len(picks) < 3:
         print("too few proxies; nothing posted")
